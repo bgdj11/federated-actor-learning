@@ -28,7 +28,7 @@ class RegionWorker(Actor):
         self.y: np.ndarray = None
         self.model: SimpleClassifier = None
         
-        self.aggregator_ref: ActorRef = None
+        self.provider_ref: ActorRef = None
         
         self.rounds_completed = 0
         
@@ -78,7 +78,7 @@ class RegionWorker(Actor):
             self.model.set_weights(msg.global_weights)
             self.log.info("Applied global weights")
             self.model.set_fedprox(getattr(msg, "mu", 0.0), msg.global_weights)
-            
+
         self.log.info(f"Starting local training ({self.local_epochs} epochs)...")
 
         total_loss = 0.0
@@ -106,12 +106,12 @@ class RegionWorker(Actor):
             }
         )
         
-        if self.aggregator_ref:
-            self.aggregator_ref.tell(update)
-            self.log.info(f"Sent ModelUpdate to aggregator "
+        if self.provider_ref:
+            self.provider_ref.tell(update)
+            self.log.info(f"Sent ModelUpdate to provider "
                           f"(loss={avg_loss:.4f}, acc={avg_acc:.4f})")
         else:
-            self.log.warning("No aggregator_ref set! Update not sent.")
+            self.log.warning("No provider_ref set! Update not sent.")
             
         self.rounds_completed += 1
         

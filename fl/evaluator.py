@@ -8,7 +8,7 @@ from actor.actor_system import Actor, ActorRef
 from actor.messages import Message, GlobalModelBroadcast, HealthPing, HealthAck, Shutdown
 from fl.model import SimpleClassifier
 
-from fl.aggregator import EvaluationResult
+from fl.provider import EvaluationResult
 
 
 class Evaluator(Actor):
@@ -22,7 +22,7 @@ class Evaluator(Actor):
         
         self.model: SimpleClassifier = None
         
-        self.aggregator_ref: ActorRef = None
+        self.provider_ref: ActorRef = None
         
         self.evaluation_history: list[dict] = []
         
@@ -103,11 +103,11 @@ class Evaluator(Actor):
             loss=metrics['loss']
         )
         
-        if self.aggregator_ref:
-            self.aggregator_ref.tell(result)
-            self.log.info("Sent evaluation result to aggregator")
+        if self.provider_ref is not None:
+            self.provider_ref.tell(result)
+            self.log.info("Sent evaluation result to provider")
         else:
-            self.log.warning("No aggregator_ref set!")
+            self.log.warning("No provider_ref set!")
             
     def _print_summary(self):
         if not self.evaluation_history:
