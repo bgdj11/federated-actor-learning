@@ -13,6 +13,7 @@ class Message:
 class TrainRequest(Message):
     round_idx: int = 0
     global_weights: Optional[np.ndarray] = None
+    mu: float = 0.0
 
 
 @dataclass
