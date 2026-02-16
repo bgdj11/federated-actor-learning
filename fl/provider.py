@@ -1,4 +1,3 @@
-# actor/provider.py
 import os
 import sys
 import asyncio
@@ -13,7 +12,7 @@ from actor.messages import (
     HealthPing, HealthAck, Shutdown
 )
 from fl.model import SimpleClassifier
-from fl.aggregator import AggregateRound, AggregatedResult
+from fl.aggregator import AggregateRound, AggregatedResult, RegisterAggregator
 
 
 @dataclass
@@ -53,6 +52,10 @@ class Provider(Actor):
         self.workers: dict[str, ActorRef] = {}
         self.evaluator_ref: Optional[ActorRef] = None
         self.aggregator_ref: Optional[ActorRef] = None
+        self._aggregator_id: Optional[str] = None
+        self._evaluator_id: Optional[str] = None
+        self._last_health_ack: dict[str, float] = {}
+        self._health_timeout = 2.5
 
         self.current_round = 0
         self.training_started = False
@@ -64,14 +67,49 @@ class Provider(Actor):
         self.history: list[dict] = []
 
         self._awaiting_aggregation = False
+        self._health_check_task: Optional[asyncio.Task] = None
+
+        self._pending_aggregate: Optional[AggregateRound] = None
+        self._pending_eval_broadcast: Optional[GlobalModelBroadcast] = None
 
     async def pre_start(self):
         self.global_model = SimpleClassifier()
         self.log.info(f"Provider started. Waiting for {self.num_workers} workers...")
+        self._health_check_task = asyncio.create_task(self._periodic_health_check())
 
-    def set_aggregator_ref(self, ref: ActorRef):
-        self.aggregator_ref = ref
-        self.log.info("Aggregator reference set in Provider")
+    async def _periodic_health_check(self):
+        await asyncio.sleep(8.0)
+        
+        while True:
+            try:
+                await asyncio.sleep(2.0)
+
+                if self.aggregator_ref:
+                    sent_at = asyncio.get_event_loop().time()
+                    self.aggregator_ref.tell(HealthPing(), sender=self.context.self_ref)
+                    asyncio.create_task(self._check_health_timeout("aggregator", sent_at))
+
+                if self.evaluator_ref:
+                    sent_at = asyncio.get_event_loop().time()
+                    self.evaluator_ref.tell(HealthPing(), sender=self.context.self_ref)
+                    asyncio.create_task(self._check_health_timeout("evaluator", sent_at))
+
+            except Exception as e:
+                self.log.error(f"Health check error: {e}")
+
+    async def _check_health_timeout(self, target: str, sent_at: float):
+        await asyncio.sleep(self._health_timeout)
+        last_ack = self._last_health_ack.get(target)
+
+        if last_ack is not None and last_ack <= sent_at:
+            if target == "aggregator":
+                if self.aggregator_ref is not None:
+                    self.log.warning("Aggregator health timeout; waiting for re-registration")
+                    self.aggregator_ref = None
+            elif target == "evaluator":
+                if self.evaluator_ref is not None:
+                    self.log.warning("Evaluator health timeout; waiting for re-registration")
+                    self.evaluator_ref = None
 
     async def receive(self, msg: Message):
         if isinstance(msg, RegisterWorker):
@@ -79,6 +117,9 @@ class Provider(Actor):
 
         elif isinstance(msg, RegisterEvaluator):
             await self._handle_register_evaluator(msg)
+
+        elif isinstance(msg, RegisterAggregator):
+            await self._handle_register_aggregator(msg)
 
         elif isinstance(msg, ModelUpdate):
             await self._handle_model_update(msg)
@@ -90,7 +131,17 @@ class Provider(Actor):
             await self._handle_evaluation_result(msg)
 
         elif isinstance(msg, HealthPing):
-            self.context.self_ref.tell(HealthAck(actor_id=self.actor_id, status="alive"))
+            if msg.sender:
+                msg.sender.tell(HealthAck(actor_id=self.actor_id, status="alive"))
+            else:
+                self.log.warning("HealthPing received but no sender!")
+
+        elif isinstance(msg, HealthAck):
+            now = asyncio.get_event_loop().time()
+            if msg.actor_id == self._aggregator_id:
+                self._last_health_ack["aggregator"] = now
+            elif msg.actor_id == self._evaluator_id:
+                self._last_health_ack["evaluator"] = now
 
         elif isinstance(msg, Shutdown):
             self.log.info("Shutting down provider...")
@@ -101,8 +152,9 @@ class Provider(Actor):
             self.log.warning(f"Worker {msg.worker_id} already registered!")
             return
 
-        wref = self.context._system.remote_ref(msg.worker_id, msg.host, msg.port)
-        self.workers[msg.worker_id] = wref
+        self.workers[msg.worker_id] = self.context._system.remote_ref(
+            msg.worker_id, msg.host, msg.port
+        )
 
         self.log.info(f"Worker registered: {msg.worker_id} (region {msg.region}) at {msg.host}:{msg.port}. "
                       f"Total: {len(self.workers)}/{self.num_workers}")
@@ -113,8 +165,31 @@ class Provider(Actor):
             await self._start_round(1)
 
     async def _handle_register_evaluator(self, msg: RegisterEvaluator):
-        self.log.info(f"Evaluator registered: {msg.evaluator_id} at {msg.host}:{msg.port}")
-        self.evaluator_ref = self.context._system.remote_ref(msg.evaluator_id, msg.host, msg.port)
+        self.log.info(f"Evaluator registered: {msg.evaluator_id}")
+        self.evaluator_ref = self.context._system.remote_ref(
+            msg.evaluator_id, msg.host, msg.port
+        )
+        self._evaluator_id = msg.evaluator_id
+        self.log.info(f"Evaluator registration complete at {msg.host}:{msg.port}")
+
+        if self._pending_eval_broadcast and self.evaluator_ref:
+            self.evaluator_ref.tell(self._pending_eval_broadcast)
+            self.log.info("Sent pending model to evaluator")
+            self._pending_eval_broadcast = None
+
+    async def _handle_register_aggregator(self, msg: RegisterAggregator):
+        self.log.info(f"Aggregator registered: {msg.aggregator_id}")
+        self.aggregator_ref = self.context._system.remote_ref(
+            msg.aggregator_id, msg.host, msg.port
+        )
+        self._aggregator_id = msg.aggregator_id
+        self.log.info(f"Aggregator registration complete at {msg.host}:{msg.port}")
+
+        if self._pending_aggregate:
+            self.log.info(f"Sending pending AggregateRound for round {self._pending_aggregate.round_idx}")
+            self.aggregator_ref.tell(self._pending_aggregate)
+            self._pending_aggregate = None
+            self._awaiting_aggregation = False  # Reset flag so system can continue
 
     async def _start_round(self, round_idx: int):
         if self.training_complete:
@@ -150,18 +225,22 @@ class Provider(Actor):
         self._round_train_metrics.append(msg.metrics)
 
         if len(self._round_weight_updates) >= self.num_workers and not self._awaiting_aggregation:
+            aggregate_msg = AggregateRound(
+                round_idx=self.current_round,
+                weight_updates=self._round_weight_updates,
+                train_metrics=self._round_train_metrics
+            )
+            
             if not self.aggregator_ref:
-                self.log.error("No aggregator_ref set in Provider!")
+                self.log.warning("No aggregator_ref set; waiting for registration")
+                self._pending_aggregate = aggregate_msg
                 return
 
             self._awaiting_aggregation = True
             self.log.info("All updates received. Sending to Aggregator...")
 
-            self.aggregator_ref.tell(AggregateRound(
-                round_idx=self.current_round,
-                weight_updates=self._round_weight_updates,
-                train_metrics=self._round_train_metrics
-            ))
+            self._pending_aggregate = aggregate_msg
+            self.aggregator_ref.tell(aggregate_msg)
 
     async def _handle_aggregated_result(self, msg: AggregatedResult):
         if msg.round_idx != self.current_round:
@@ -170,6 +249,8 @@ class Provider(Actor):
         if self.global_model is None:
             self.log.error("Global model not initialized!")
             return
+
+        self._pending_aggregate = None
 
         self.global_model.set_weights(msg.weights)
 
@@ -189,14 +270,18 @@ class Provider(Actor):
         for _, wref in self.workers.items():
             wref.tell(bcast)
 
+        self._pending_eval_broadcast = bcast
+        
         if self.evaluator_ref:
             self.evaluator_ref.tell(bcast)
             self.log.info("Sent model to evaluator for evaluation")
         else:
-            await self._proceed_to_next_round()
+            self.log.warning("No evaluator_ref set; waiting for registration")
 
     async def _handle_evaluation_result(self, msg: EvaluationResult):
         self.log.info(f"Eval for round {msg.round_idx}: acc={msg.accuracy:.4f}, loss={msg.loss:.4f}")
+
+        self._pending_eval_broadcast = None
 
         if self.history and self.history[-1]["round"] == msg.round_idx:
             self.history[-1]["eval_accuracy"] = float(msg.accuracy)
@@ -233,5 +318,7 @@ class Provider(Actor):
             )
 
     async def post_stop(self):
+        if self._health_check_task:
+            self._health_check_task.cancel()
         self._print_summary()
         self.log.info("Provider stopped.")

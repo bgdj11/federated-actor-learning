@@ -1,12 +1,24 @@
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 import numpy as np
 import uuid
+
+if TYPE_CHECKING:
+    from actor.actor_system import ActorRef, ActorSystem
 
 
 @dataclass
 class Message:
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    _sender_id: Optional[str] = None
+    _system: Optional['ActorSystem'] = field(default=None, repr=False, compare=False)
+    
+    @property
+    def sender(self) -> Optional['ActorRef']:
+        if self._sender_id and self._system:
+            from actor.actor_system import ActorRef
+            return ActorRef(self._sender_id, self._system)
+        return None
 
 
 @dataclass

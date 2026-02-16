@@ -7,22 +7,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from actor.actor_system import Actor, ActorRef
 from actor.messages import Message, GlobalModelBroadcast, HealthPing, HealthAck, Shutdown
 from fl.model import SimpleClassifier
-
-from fl.provider import EvaluationResult
+from fl.provider import EvaluationResult, RegisterEvaluator
+from storage.persistence import RoundPersistence
 
 
 class Evaluator(Actor):
-    def __init__(self, data_dir: str = "dataset"):
+    def __init__(self, data_dir: str = "dataset", provider_ref: ActorRef = None):
 
         super().__init__()
         self.data_dir = data_dir
+        self.persistence = RoundPersistence()
         
         self.X_test: np.ndarray = None
         self.y_test: np.ndarray = None
         
         self.model: SimpleClassifier = None
         
-        self.provider_ref: ActorRef = None
+        self.provider_ref: ActorRef = provider_ref
         
         self.evaluation_history: list[dict] = []
         
@@ -43,6 +44,18 @@ class Evaluator(Actor):
         
         self.model = SimpleClassifier()
         self.log.info("Evaluator ready")
+
+        if self.provider_ref:
+            advertised_host = "localhost"
+            if self.context._system.host not in ("0.0.0.0", "127.0.0.1", "localhost"):
+                advertised_host = self.context._system.host
+
+            self.provider_ref.tell(RegisterEvaluator(
+                evaluator_id=self.actor_id,
+                host=advertised_host,
+                port=self.context._system.port
+            ))
+            self.log.info("Registered with provider")
         
     async def receive(self, msg: Message):
         
@@ -50,11 +63,13 @@ class Evaluator(Actor):
             await self._handle_global_model(msg)
             
         elif isinstance(msg, HealthPing):
-            if self.context.parent:
-                self.context.parent.tell(HealthAck(
-                    actor_id=self.actor_id,
-                    status="alive"
-                ))
+            # Dual handling: respond via msg.sender (for local Supervisor) or provider_ref (for remote Provider)
+            if msg.sender:
+                # Respond to whoever sent the ping (works for local Supervisor)
+                msg.sender.tell(HealthAck(actor_id=self.actor_id, status="alive"))
+            elif self.provider_ref:
+                # Fallback to provider_ref for remote pings
+                self.provider_ref.tell(HealthAck(actor_id=self.actor_id, status="alive"))
                 
         elif isinstance(msg, Shutdown):
             self.log.info("Shutting down evaluator...")
@@ -96,6 +111,15 @@ class Evaluator(Actor):
             'loss': metrics['loss'],
             'per_class_accuracy': per_class_acc
         })
+        
+        self.persistence.save_round(
+            msg.round_idx,
+            eval_metrics={
+                "eval_accuracy": metrics['accuracy'],
+                "eval_loss": metrics['loss'],
+                "per_class_accuracy": per_class_acc
+            }
+        )
         
         result = EvaluationResult(
             round_idx=msg.round_idx,

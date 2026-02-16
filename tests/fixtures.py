@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from actor.actor_system import Actor
-from actor.messages import Message
+from actor.messages import Message, HealthPing, HealthAck
 
 @dataclass
 class Ping(Message):
@@ -93,8 +93,12 @@ class CounterActor(Actor):
         self.messages = []
 
     async def receive(self, msg):
-        self.count += 1
-        self.messages.append(msg)
+        if isinstance(msg, HealthPing):
+            if msg.sender:
+                msg.sender.tell(HealthAck(actor_id=self.actor_id, status="alive"))
+        else:
+            self.count += 1
+            self.messages.append(msg)
 
 
 class EchoActor(Actor): 

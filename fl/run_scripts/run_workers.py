@@ -7,8 +7,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from actor.actor_system import ActorSystem
+from actor.supervisor import Supervisor, MonitorChild
 from fl.worker import RegionWorker
-from fl.provider import RegisterWorker
 
 
 async def main(
@@ -19,52 +19,59 @@ async def main(
     local_epochs: int,
     batch_size: int,
     lr: float,
-    data_dir: str
+    data_dir: str,
+    health_check: bool = True,
 ):
     system = ActorSystem(name="workers-abc-system", host=host, port=port)
-    await system.start_server()
-    print(f"[INFO] Workers TCP server started on {host}:{system.port}")
+    try:
+        await system.start_server()
+        print(f"[INFO] Workers TCP server started on {host}:{system.port}")
+    except OSError as e:
+        if e.errno == 10048 or "address already in use" in str(e).lower():
+            print(f"[ERROR] Port {port} is already in use!")
+            print(f"[ERROR] Kill existing Python processes or use a different port.")
+            print(f"[ERROR] Run: Get-Process python | Stop-Process -Force")
+            sys.exit(1)
+        raise
+
+    if health_check:
+        supervisor_ref = system.actor_of(Supervisor, "supervisor", health_check_interval=5.0, health_timeout=3.0)
+        print("[INFO] Supervisor started (health check enabled for workers)")
+    else:
+        supervisor_ref = None
 
     provider_ref = system.remote_ref("provider", provider_host, provider_port)
     print(f"[INFO] Created remote reference to provider at {provider_host}:{provider_port}")
 
     regions = ["A", "B", "C"]
-    worker_ids = {}
-
+    
     for region in regions:
         worker_id = f"worker-{region}"
-        worker_ids[region] = worker_id
-
-        system.actor_of(
-            RegionWorker,
-            worker_id,
-            region=region,
-            data_dir=data_dir,
-            local_epochs=local_epochs,
-            batch_size=batch_size,
-            lr=lr
-        )
-
-        worker_actor = system._actors[worker_id]
-        worker_actor.provider_ref = provider_ref
-
-        print(f"[INFO] Worker created: {worker_id} (region {region})")
-
-    await asyncio.sleep(1)
-
-    # IMPORTANT: provider must be able to call back this worker via host+port
-    advertised_host = "localhost" if host in ("0.0.0.0", "127.0.0.1", "localhost") else host
-
-    for region in regions:
-        provider_ref.tell(RegisterWorker(
-            worker_id=worker_ids[region],
-            region=region,
-            host=advertised_host,
-            port=system.port
-        ))
-        print(f"[INFO] Registered {worker_ids[region]} with provider at {provider_host}:{provider_port}")
-
-    print("\n[INFO] Waiting for training commands...")
+        
+        if supervisor_ref:
+            supervisor_ref.tell(MonitorChild(
+                child_id=worker_id,
+                actor_class=RegionWorker,
+                kwargs={
+                    "region": region,
+                    "data_dir": data_dir,
+                    "local_epochs": local_epochs,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "provider_ref": provider_ref
+                }
+            ))
+        else:
+            system.actor_of(
+                RegionWorker,
+                worker_id,
+                region=region,
+                data_dir=data_dir,
+                local_epochs=local_epochs,
+                batch_size=batch_size,
+                lr=lr,
+                provider_ref=provider_ref
+            )
     print("[INFO] Press Ctrl+C to stop\n")
 
     stop_event = asyncio.Event()
@@ -74,11 +81,14 @@ async def main(
         stop_event.set()
 
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError:
-            pass
+    if sys.platform == "win32":
+        signal.signal(signal.SIGINT, lambda s, f: signal_handler())
+    else:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, signal_handler)
+            except NotImplementedError:
+                pass
 
     await stop_event.wait()
     print("[INFO] Shutting down workers system...")
@@ -96,11 +106,13 @@ if __name__ == "__main__":
     p.add_argument("--batch-size", type=int, default=32, help="Batch size (default: 32)")
     p.add_argument("--lr", type=float, default=0.01, help="Learning rate (default: 0.01)")
     p.add_argument("--data-dir", type=str, default="dataset", help="Dataset directory (default: dataset)")
+    p.add_argument("--health-check", action="store_true", default=True, help="Enable health checks (default: enabled)")
+    p.add_argument("--no-health-check", action="store_false", dest="health_check", help="Disable health checks")
     args = p.parse_args()
 
     asyncio.run(main(
         args.host, args.port,
         args.provider_host, args.provider_port,
         args.epochs, args.batch_size, args.lr,
-        args.data_dir
+        args.data_dir, args.health_check
     ))

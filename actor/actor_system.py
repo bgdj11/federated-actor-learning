@@ -2,6 +2,7 @@ import asyncio
 import pickle
 import logging
 import ssl
+from contextvars import ContextVar
 from typing import Any, Callable, Optional, Type
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -11,6 +12,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message
 
 MiddlewareFunc = Callable[[str, Message], Optional[Message]]
 
+_current_actor_id: ContextVar[Optional[str]] = ContextVar('current_actor_id', default=None)
+
 
 @dataclass
 class ActorRef:
@@ -18,7 +21,15 @@ class ActorRef:
     _system: 'ActorSystem'
     _remote_addr: Optional[tuple] = None
 
-    def tell(self, msg: Message):
+    def tell(self, msg: Message, sender: Optional['ActorRef'] = None):
+        if msg._sender_id is None:
+            if sender:
+                msg._sender_id = sender.actor_id
+            else:
+                sender_id = _current_actor_id.get()
+                if sender_id:
+                    msg._sender_id = sender_id
+        
         if self._remote_addr:
             asyncio.create_task(self._system._send_remote(self._remote_addr, self.actor_id, msg))
         else:
@@ -51,6 +62,7 @@ class Actor(ABC):
         self.context: Optional['ActorContext'] = None
         self._behavior: Callable = self.receive
         self._logger: Optional[logging.Logger] = None
+        self._current_sender: Optional['ActorRef'] = None
 
     @property
     def log(self) -> logging.Logger:
@@ -85,6 +97,10 @@ class ActorContext:
     @property
     def self_ref(self) -> ActorRef:
         return ActorRef(self._actor.actor_id, self._system)
+
+    @property
+    def sender(self) -> Optional['ActorRef']:
+        return self._actor._current_sender
 
     def actor_of(self, actor_class: Type[Actor], actor_id: str, **kwargs) -> ActorRef:
         ref = self._system.actor_of(actor_class, actor_id, **kwargs)
@@ -205,8 +221,14 @@ class ActorSystem:
                 msg = self._apply_receive_middleware(actor_id, msg)
                 if msg is None:
                     continue
-                    
-                await actor._behavior(msg)
+
+                msg._system = self
+                
+                token = _current_actor_id.set(actor_id)
+                try:
+                    await actor._behavior(msg)
+                finally:
+                    _current_actor_id.reset(token)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -219,13 +241,15 @@ class ActorSystem:
         msg = self._apply_send_middleware(actor_id, msg)
         if msg is None:
             return
+        msg._system = self
         if actor_id in self._mailboxes:
             await self._mailboxes[actor_id].put(msg)
 
     async def start_server(self):
+        bind_host = "127.0.0.1" if self.host == "localhost" else self.host
         self._server = await asyncio.start_server(
-            self._handle_connection, 
-            self.host, 
+            self._handle_connection,
+            bind_host,
             self.port,
             ssl=self._ssl_context
         )
@@ -256,12 +280,14 @@ class ActorSystem:
         msg = self._apply_send_middleware(actor_id, msg)
         if msg is None:
             return
+        msg._system = None
             
         try:
             key = addr
             if key not in self._remote_connections:
+                connect_host = "127.0.0.1" if addr[0] == "localhost" else addr[0]
                 reader, writer = await asyncio.open_connection(
-                    addr[0], 
+                    connect_host,
                     addr[1],
                     ssl=self._ssl_client_context
                 )

@@ -10,12 +10,14 @@ from actor.messages import (
     HealthPing, HealthAck, Shutdown
 )
 from fl.model import SimpleClassifier
+from fl.provider import RegisterWorker
 
 
 class RegionWorker(Actor):
 
     def __init__(self, region: str, data_dir: str = "dataset", 
-                 local_epochs: int = 3, batch_size: int = 32, lr: float = 0.01):
+                 local_epochs: int = 3, batch_size: int = 32, lr: float = 0.01,
+                 provider_ref: ActorRef = None):
 
         super().__init__()
         self.region = region
@@ -28,7 +30,7 @@ class RegionWorker(Actor):
         self.y: np.ndarray = None
         self.model: SimpleClassifier = None
         
-        self.provider_ref: ActorRef = None
+        self.provider_ref: ActorRef = provider_ref
         
         self.rounds_completed = 0
         
@@ -49,6 +51,19 @@ class RegionWorker(Actor):
         
         self.model = SimpleClassifier(lr=self.lr)
         self.log.info(f"Model initialized with lr={self.lr}")
+
+        if self.provider_ref:
+            advertised_host = "localhost"
+            if self.context._system.host not in ("0.0.0.0", "127.0.0.1", "localhost"):
+                advertised_host = self.context._system.host
+
+            self.provider_ref.tell(RegisterWorker(
+                worker_id=self.actor_id,
+                region=self.region,
+                host=advertised_host,
+                port=self.context._system.port
+            ))
+            self.log.info("Registered with provider")
         
     async def receive(self, msg: Message):
         if isinstance(msg, TrainRequest):
@@ -58,11 +73,13 @@ class RegionWorker(Actor):
             await self._handle_global_model(msg)
             
         elif isinstance(msg, HealthPing):
-            if self.context.parent:
-                self.context.parent.tell(HealthAck(
-                    actor_id=self.actor_id,
-                    status="alive"
-                ))
+            # Dual handling: respond via msg.sender (for local Supervisor) or provider_ref (for remote Provider)
+            if msg.sender:
+                # Respond to whoever sent the ping (works for local Supervisor)
+                msg.sender.tell(HealthAck(actor_id=self.actor_id, status="alive"))
+            elif self.provider_ref:
+                # Fallback to provider_ref for remote pings
+                self.provider_ref.tell(HealthAck(actor_id=self.actor_id, status="alive"))
                 
         elif isinstance(msg, Shutdown):
             self.log.info("Shutting down...")

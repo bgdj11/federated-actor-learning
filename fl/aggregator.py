@@ -7,8 +7,9 @@ from typing import List, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from actor.actor_system import Actor, ActorRef
-from actor.messages import Message
+from actor.messages import Message, HealthPing, HealthAck
 from fl.model import federated_averaging
+from storage.persistence import RoundPersistence
 
 
 @dataclass
@@ -25,20 +26,40 @@ class AggregatedResult(Message):
     train_summary: dict = None
 
 @dataclass
-class RegisterProvider(Message):
-    provider_id: str = "provider"
+class RegisterAggregator(Message):
+    aggregator_id: str = "aggregator"
     host: str = "localhost"
     port: int = 0
+    
 
 class Aggregator(Actor):
-    def __init__(self):
+    def __init__(self, provider_ref: ActorRef = None):
         super().__init__()
-        self.provider_ref: Optional[ActorRef] = None
+        self.provider_ref: Optional[ActorRef] = provider_ref
+        self.persistence = RoundPersistence()
+
+    async def pre_start(self):
+        if self.provider_ref:
+            advertised_host = "localhost"
+            if self.context._system.host not in ("0.0.0.0", "127.0.0.1", "localhost"):
+                advertised_host = self.context._system.host
+
+            self.provider_ref.tell(RegisterAggregator(
+                aggregator_id=self.actor_id,
+                host=advertised_host,
+                port=self.context._system.port
+            ))
+            self.log.info("Registered with provider")
 
     async def receive(self, msg: Message):
-        if isinstance(msg, RegisterProvider):
-            self.provider_ref = self.context._system.remote_ref(msg.provider_id, msg.host, msg.port)
-            self.log.info(f"Registered provider at {msg.host}:{msg.port} (id={msg.provider_id})")
+        if isinstance(msg, HealthPing):
+            # Dual handling: respond via msg.sender (for local Supervisor) or provider_ref (for remote Provider)
+            if msg.sender:
+                # Respond to whoever sent the ping (works for local Supervisor)
+                msg.sender.tell(HealthAck(actor_id=self.actor_id, status="alive"))
+            elif self.provider_ref:
+                # Fallback to provider_ref for remote pings
+                self.provider_ref.tell(HealthAck(actor_id=self.actor_id, status="alive"))
             return
 
         if isinstance(msg, AggregateRound):
@@ -58,6 +79,15 @@ class Aggregator(Actor):
                 round_idx=msg.round_idx,
                 weights=aggregated,
                 train_summary={
+                    "train_avg_loss": train_avg_loss,
+                    "train_avg_accuracy": train_avg_acc
+                }
+            )
+
+            self.persistence.save_round(
+                msg.round_idx,
+                weights=aggregated,
+                train_metrics={
                     "train_avg_loss": train_avg_loss,
                     "train_avg_accuracy": train_avg_acc
                 }
