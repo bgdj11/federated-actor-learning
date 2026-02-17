@@ -274,7 +274,10 @@ class ActorSystem:
             pass
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except ConnectionResetError:
+                pass
 
     async def _send_remote(self, addr: tuple, actor_id: str, msg: Message):
         msg = self._apply_send_middleware(actor_id, msg)
@@ -312,7 +315,10 @@ class ActorSystem:
 
         for reader, writer in self._remote_connections.values():
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except ConnectionResetError:
+                pass
 
         if self._server:
             self._server.close()

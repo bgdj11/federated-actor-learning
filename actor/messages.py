@@ -43,29 +43,6 @@ class GlobalModelBroadcast(Message):
 
 
 @dataclass
-class PeerJoin(Message):
-    peer_id: str = ""
-    host: str = "localhost"
-    port: int = 0
-
-
-@dataclass
-class PeerLeave(Message):
-    peer_id: str = ""
-
-
-@dataclass 
-class PeerReady(Message):
-    peer_id: str = ""
-    round_idx: int = 0
-
-
-@dataclass
-class StartRound(Message):
-    round_idx: int = 0
-
-
-@dataclass
 class HealthPing(Message):
     pass
 
@@ -88,12 +65,26 @@ class RestartChild(Message):
 
 
 @dataclass
-class CRDTDelta(Message):
-    crdt_type: str = ""
-    key: str = ""
-    delta: Any = None
+class Shutdown(Message):
+    pass
+
+@dataclass
+class GossipPeerJoin(Message):
+    peer_id: str = ""
+    host: str = "localhost"
+    port: int = 0
 
 
 @dataclass
-class Shutdown(Message):
-    pass
+class GossipState(Message):
+    peer_id: str = ""
+    round_num: int = 0
+    delta_norm: float = 0.0
+    crdt_deltas: list = field(default_factory=list) 
+    peer_info: dict = field(default_factory=dict) 
+
+
+@dataclass
+class MembershipUpdate(Message):
+    active_peers: list = field(default_factory=list)
+    timestamp: float = 0.0
